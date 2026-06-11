@@ -3,16 +3,18 @@ import json
 import threading
 import time
 import shutil
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Optional
 
 import requests
 
 from .config import load_config
+from .cover import download_cover, resolve_cover_url
 from .downloader import download_file_with_retry
 from .enhancer import enhance_video_to_1080p
-from .source_selector import collect_source_candidates, select_best_source
+from .source_selector import collect_source_candidates, select_best_source, source_height
 from .utils import clean_filename, thread_safe_print
 
 
@@ -20,8 +22,22 @@ HEADERS = {
     'Referer': 'http://www.tangdou.com/',
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36',
 }
-MAX_WORKERS = 3
+DOWNLOAD_WORKERS = 3
+FFMPEG_ENHANCE_WORKERS = 2
+REALESRGAN_ENHANCE_WORKERS = 1
 PREFER_HIGHEST_SOURCE = True
+TANGDOU_HEAD_EXTRA_SECONDS = 2.0
+
+
+@dataclass(frozen=True)
+class VideoDownloadResult:
+    success: bool
+    fail_info: Optional[str]
+    video_info: str
+    data: dict
+    play_data: Optional[dict] = None
+    source_choice: object = None
+    outcome: object = None
 
 
 def load_urls_from_log():
@@ -125,26 +141,51 @@ def _video_upscale_config(base_config, data):
     head_t = _to_float(data.get('head_t'), 0.0)
     end_t = _to_float(data.get('end_t'), 0.0)
     duration = _to_float(data.get('duration'), 0.0)
-    trim_duration = max(duration - head_t - end_t, 0.0) if duration > 0 else 0.0
+    trim_head = head_t + TANGDOU_HEAD_EXTRA_SECONDS if head_t > 0 else 0.0
+    trim_duration = max(duration - trim_head - end_t, 0.0) if duration > 0 else 0.0
     return replace(
         base_config,
-        trim_head_seconds=head_t,
+        trim_head_seconds=trim_head,
         trim_duration_seconds=trim_duration,
     )
 
 
-def _handle_upscale(outcome, source_choice, config, counter, lock, video_info, data):
-    should_upscale = outcome.success and outcome.downloaded and config.upscale.enabled and not source_choice.is_hd
+def _enhance_worker_count(config):
+    if config.upscale.enhance_engine == 'realesrgan':
+        return REALESRGAN_ENHANCE_WORKERS
+    return FFMPEG_ENHANCE_WORKERS
+
+
+def _should_enhance_download_result(download_result, upscale_config):
+    is_new_download = download_result.success and download_result.outcome and download_result.outcome.downloaded
+    if not is_new_download or not download_result.source_choice:
+        return False
+
+    source_size = source_height(download_result.source_choice)
+    is_low_source = source_size == 0 or source_size < upscale_config.target_height
+    return not download_result.source_choice.is_hd and is_low_source
+
+
+def _handle_upscale(outcome, source_choice, config, counter, lock, video_info, data, play_data):
+    source_size = source_height(source_choice)
+    is_low_source = source_size == 0 or source_size < config.upscale.target_height
+    should_upscale = outcome.success and outcome.downloaded and config.upscale.enabled and not source_choice.is_hd and is_low_source
     if not should_upscale:
         return
 
     try:
         upscale_config = _video_upscale_config(config.upscale, data)
+        cover_url = resolve_cover_url(data, play_data)
+        cover_path = download_cover(
+            cover_url,
+            Path(config.upscale.output_dir) / f'{outcome.filepath.stem}_cover.jpg',
+            HEADERS,
+        )
         thread_safe_print(
             f'[增强] {video_info} 普通源下载完成，开始使用 {config.upscale.enhance_engine} '
             f'生成 {config.upscale.target_height}p 增强版，裁剪片头 {upscale_config.trim_head_seconds:g} 秒'
         )
-        upscale_result = enhance_video_to_1080p(outcome.filepath, upscale_config, config.tools)
+        upscale_result = enhance_video_to_1080p(outcome.filepath, upscale_config, config.tools, cover_path=cover_path)
         thread_safe_print(f'[增强] {video_info} {upscale_result.message}')
         counter_key = 'upscale_skip' if upscale_result.skipped else 'upscale_success'
         _update_counter(counter, lock, counter_key)
@@ -170,8 +211,8 @@ def _print_play_response_debug(video_info, video_data):
         print(f'  - {hd_text} | score={candidate.score} | {candidate.label} | {url_text}')
 
 
-def download_single_video(data, num, page_size, download_dir, config, counter, lock, retry_info_list, retry_lock):
-    """下载单个视频，并在必要时触发视频增强。"""
+def download_single_video(data, num, page_size, download_dir, config, lock, retry_info_list, retry_lock):
+    """下载单个视频，返回后续增强所需的信息。"""
     title = data.get('title', '未知')
     video_info = f'{num} - {title}'
     try:
@@ -202,18 +243,29 @@ def download_single_video(data, num, page_size, download_dir, config, counter, l
         )
 
         if outcome.success:
-            _update_counter(counter, lock, 'success')
-            _handle_upscale(outcome, source_choice, config, counter, lock, video_info, data)
             thread_safe_print(f'✓ 下载成功: {video_info}')
-            return True, None
+            return VideoDownloadResult(True, None, video_info, data, video_data, source_choice, outcome)
 
-        _update_counter(counter, lock, 'fail')
         thread_safe_print(f'✗ 下载失败: {video_info}')
-        return False, video_info
+        return VideoDownloadResult(False, video_info, video_info, data, video_data, source_choice, outcome)
     except Exception as e:
-        _update_counter(counter, lock, 'fail')
         thread_safe_print(f'===》下载出错 [{num}]: {e}')
-        return False, video_info
+        return VideoDownloadResult(False, video_info, video_info, data)
+
+
+def enhance_single_video(download_result, config, counter, lock):
+    if not download_result.success:
+        return
+    _handle_upscale(
+        download_result.outcome,
+        download_result.source_choice,
+        config,
+        counter,
+        lock,
+        download_result.video_info,
+        download_result.data,
+        download_result.play_data,
+    )
 
 
 def _print_retry_info(retry_info_list):
@@ -271,14 +323,13 @@ def download_video():
     total_count = len(all_videos)
     start_time = time.time()
     counter = {
-        'success': 0,
-        'fail': 0,
         'upscale_success': 0,
         'upscale_skip': 0,
         'upscale_fail': 0,
         'upscale_seconds': 0.0,
     }
     failed_files = []
+    download_results = []
     retry_info_list = []
     lock = threading.Lock()
 
@@ -286,9 +337,9 @@ def download_video():
     print('[阶段2] 开始下载所有视频')
     print(f'[统计] 总视频数: {total_count}')
     print(f'{"=" * 60}\n')
-    print(f'[配置] 线程池大小: {MAX_WORKERS} (分段续传策略：兼顾速度和稳定性)')
+    print(f'[配置] 下载并发: {DOWNLOAD_WORKERS} (分段续传策略：兼顾速度和稳定性)')
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as executor:
         future_info = {}
         for video_info in all_videos:
             data = video_info['data']
@@ -301,7 +352,6 @@ def download_video():
                 total_count,
                 download_dir,
                 config,
-                counter,
                 lock,
                 retry_info_list,
                 lock,
@@ -314,20 +364,53 @@ def download_video():
         for future in as_completed(future_info):
             num, title, page_info = future_info[future]
             try:
-                success, fail_info = future.result()
+                result = future.result()
+                download_results.append(result)
                 completed += 1
-                completed_success += 1 if success else 0
-                completed_fail += 0 if success else 1
-                if not success and fail_info:
-                    failed_files.append(f'{fail_info} ({page_info})')
+                completed_success += 1 if result.success else 0
+                completed_fail += 0 if result.success else 1
+                if not result.success and result.fail_info:
+                    failed_files.append(f'{result.fail_info} ({page_info})')
                 if completed % 5 == 0 or completed == total_count:
                     print(f'[进度] 已完成: {completed}/{total_count} | 成功: {completed_success} | 失败: {completed_fail}')
             except Exception as e:
-                _update_counter(counter, lock, 'fail')
                 completed += 1
                 completed_fail += 1
                 failed_files.append(f'{num} - {title} ({page_info})')
                 print(f'[错误] 任务执行异常 [{num}] ({page_info}): {e}')
+
+    enhance_candidates = [
+        result
+        for result in download_results
+        if _should_enhance_download_result(result, config.upscale)
+    ]
+    if config.upscale.enabled and enhance_candidates:
+        enhance_workers = _enhance_worker_count(config)
+        print(f'\n{"=" * 60}')
+        print('[阶段3] 开始增强新下载的普通源视频')
+        print(f'[配置] 增强方式: {config.upscale.enhance_engine} | 目标: {config.upscale.target_height}p | 增强并发: {enhance_workers}')
+        print(f'{"=" * 60}\n')
+
+        with ThreadPoolExecutor(max_workers=enhance_workers) as executor:
+            future_info = {
+                executor.submit(enhance_single_video, result, config, counter, lock): result
+                for result in enhance_candidates
+            }
+            enhance_completed = 0
+            for future in as_completed(future_info):
+                result = future_info[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    _update_counter(counter, lock, 'upscale_fail')
+                    print(f'[增强失败] {result.video_info}: {e}')
+                enhance_completed += 1
+                if enhance_completed % 5 == 0 or enhance_completed == len(enhance_candidates):
+                    print(f'[增强进度] 已处理: {enhance_completed}/{len(enhance_candidates)}')
+    elif not config.upscale.enabled:
+        print('\n[增强] 配置已关闭，跳过视频增强阶段')
+    else:
+        print('\n[增强] 没有需要增强的新下载普通源视频')
 
     total_time = time.time() - start_time
     _print_retry_info(retry_info_list)
@@ -338,7 +421,7 @@ def download_video():
             print(f'  ✗ {fail_file}')
 
     print(f'\n{"=" * 60}')
-    print('[统计] 下载完成')
+    print('[统计] 任务完成')
     print(f'  总视频数: {total_count}')
     print(f'  成功: {completed_success}')
     print(f'  失败: {completed_fail}')

@@ -36,6 +36,11 @@ def _height_from_text(text):
     return int(match.group(1)) if match else 0
 
 
+def source_height(choice):
+    """从候选源标签和 URL 中识别视频高度，识别不到返回 0。"""
+    return _height_from_text(f'{choice.label} {choice.url}')
+
+
 def _score(node, key_path):
     label = '.'.join(key_path)
     text = label.lower()

@@ -8,6 +8,15 @@ from pathlib import Path
 from .utils import verify_mp4_file
 
 
+HARDWARE_ENCODERS = (
+    ('h264_nvenc', ('-c:v', 'h264_nvenc', '-preset', 'fast', '-cq', '21', '-b:v', '0')),
+    ('h264_qsv', ('-c:v', 'h264_qsv', '-global_quality', '23')),
+    ('h264_amf', ('-c:v', 'h264_amf', '-quality', 'speed', '-qp_i', '22', '-qp_p', '22')),
+)
+CPU_ENCODER = ('libx264', ('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20'))
+_ENCODER_CACHE = {}
+
+
 @dataclass(frozen=True)
 class UpscaleOutcome:
     success: bool
@@ -29,12 +38,45 @@ def _run(command):
         raise RuntimeError(error_text or f'命令执行失败: {command[0]}')
 
 
+def _available_encoders(ffmpeg_path):
+    result = subprocess.run(
+        [ffmpeg_path, '-hide_banner', '-encoders'],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return set()
+
+    encoders = set()
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            encoders.add(parts[1])
+    return encoders
+
+
+def _encoder_attempts(ffmpeg_path):
+    cached_encoder = _ENCODER_CACHE.get(ffmpeg_path)
+    if cached_encoder:
+        if cached_encoder[0] == CPU_ENCODER[0]:
+            return [cached_encoder]
+        return [cached_encoder, CPU_ENCODER]
+
+    available = _available_encoders(ffmpeg_path)
+    hardware_attempts = [encoder for encoder in HARDWARE_ENCODERS if encoder[0] in available]
+    return [*hardware_attempts, CPU_ENCODER]
+
+
 def _output_path(input_path, upscale_config):
     return Path(upscale_config.output_dir) / f'{input_path.stem}_{upscale_config.target_height}p.mp4'
 
 
 def _temp_output_path(output_path):
     return output_path.with_name(f'{output_path.stem}.tmp{output_path.suffix}')
+
+
+def _video_only_temp_output_path(output_path):
+    return output_path.with_name(f'{output_path.stem}.video_tmp{output_path.suffix}')
 
 
 def _seek_args(seconds):
@@ -46,7 +88,7 @@ def _duration_args(seconds):
 
 
 def _video_filter(upscale_config):
-    return f'scale=-2:{upscale_config.target_height}:flags=bicubic,unsharp=3:3:0.6'
+    return f'scale=-2:{upscale_config.target_height}:flags=bicubic,unsharp=3:3:0.35,format=yuv420p'
 
 
 def _enhance_with_ffmpeg(input_path, output_path, upscale_config, tool_config):
@@ -55,28 +97,36 @@ def _enhance_with_ffmpeg(input_path, output_path, upscale_config, tool_config):
 
     start_time = time.time()
     temp_output_path = _temp_output_path(output_path)
-    temp_output_path.unlink(missing_ok=True)
-    _run([
-        tool_config.ffmpeg_path,
-        '-hide_banner',
-        '-loglevel', 'error',
-        '-y',
-        *_seek_args(upscale_config.trim_head_seconds),
-        *_duration_args(upscale_config.trim_duration_seconds),
-        '-i', str(input_path),
-        '-vf', _video_filter(upscale_config),
-        '-c:v', 'libx264',
-        '-preset', 'veryfast',
-        '-crf', '20',
-        '-c:a', 'copy',
-        str(temp_output_path),
-    ])
-    if not verify_mp4_file(temp_output_path):
+    last_error = None
+
+    for encoder_name, encoder_args in _encoder_attempts(tool_config.ffmpeg_path):
         temp_output_path.unlink(missing_ok=True)
-        raise RuntimeError(f'FFmpeg 输出文件校验失败: {temp_output_path}')
-    temp_output_path.replace(output_path)
-    elapsed = time.time() - start_time
-    return UpscaleOutcome(True, False, output_path, f'FFmpeg 增强完成: {output_path}', elapsed)
+        try:
+            _run([
+                tool_config.ffmpeg_path,
+                '-hide_banner',
+                '-loglevel', 'error',
+                '-y',
+                *_seek_args(upscale_config.trim_head_seconds),
+                *_duration_args(upscale_config.trim_duration_seconds),
+                '-i', str(input_path),
+                '-vf', _video_filter(upscale_config),
+                *encoder_args,
+                '-c:a', 'copy',
+                str(temp_output_path),
+            ])
+            if not verify_mp4_file(temp_output_path):
+                raise RuntimeError(f'FFmpeg 输出文件校验失败: {temp_output_path}')
+
+            _ENCODER_CACHE[tool_config.ffmpeg_path] = (encoder_name, encoder_args)
+            temp_output_path.replace(output_path)
+            elapsed = time.time() - start_time
+            return UpscaleOutcome(True, False, output_path, f'FFmpeg 增强完成({encoder_name}): {output_path}', elapsed)
+        except Exception as e:
+            last_error = e
+            temp_output_path.unlink(missing_ok=True)
+
+    raise RuntimeError(f'FFmpeg 增强失败: {last_error}')
 
 
 def _enhance_with_realesrgan(input_path, output_path, upscale_config, tool_config):
@@ -148,12 +198,58 @@ def _enhance_with_realesrgan(input_path, output_path, upscale_config, tool_confi
     return UpscaleOutcome(True, False, output_path, f'Real-ESRGAN 增强完成: {output_path}', elapsed)
 
 
-def enhance_video_to_1080p(input_path, upscale_config, tool_config):
+def _attach_cover(video_path, output_path, cover_path, tool_config):
+    if not cover_path:
+        return Path(video_path)
+
+    video_path = Path(video_path)
+    output_path = Path(output_path)
+    cover_path = Path(cover_path)
+    if not cover_path.exists():
+        return video_path
+
+    normalized_cover_path = output_path.with_name(f'{output_path.stem}.cover_tmp.jpg')
+    temp_output_path = _temp_output_path(output_path)
+    normalized_cover_path.unlink(missing_ok=True)
+    temp_output_path.unlink(missing_ok=True)
+    _run([
+        tool_config.ffmpeg_path,
+        '-hide_banner',
+        '-loglevel', 'error',
+        '-y',
+        '-i', str(cover_path),
+        '-frames:v', '1',
+        str(normalized_cover_path),
+    ])
+    _run([
+        tool_config.ffmpeg_path,
+        '-hide_banner',
+        '-loglevel', 'error',
+        '-y',
+        '-i', str(video_path),
+        '-i', str(normalized_cover_path),
+        '-map', '0',
+        '-map', '1',
+        '-c', 'copy',
+        '-disposition:v:1', 'attached_pic',
+        str(temp_output_path),
+    ])
+    if not verify_mp4_file(temp_output_path):
+        temp_output_path.unlink(missing_ok=True)
+        normalized_cover_path.unlink(missing_ok=True)
+        raise RuntimeError(f'封面写入后文件校验失败: {temp_output_path}')
+    temp_output_path.replace(output_path)
+    normalized_cover_path.unlink(missing_ok=True)
+    return output_path
+
+
+def enhance_video_to_1080p(input_path, upscale_config, tool_config, cover_path=None):
     """按配置生成增强版视频。"""
     input_path = Path(input_path)
     output_dir = Path(upscale_config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = _output_path(input_path, upscale_config)
+    working_output_path = _video_only_temp_output_path(output_path) if cover_path else output_path
 
     if output_path.exists() and verify_mp4_file(output_path):
         return UpscaleOutcome(True, True, output_path, f'增强版已存在: {output_path}')
@@ -161,6 +257,14 @@ def enhance_video_to_1080p(input_path, upscale_config, tool_config):
         output_path.unlink()
     if not upscale_config.enabled:
         return UpscaleOutcome(True, True, None, '视频增强未启用')
+    if working_output_path.exists():
+        working_output_path.unlink()
     if upscale_config.enhance_engine == 'realesrgan':
-        return _enhance_with_realesrgan(input_path, output_path, upscale_config, tool_config)
-    return _enhance_with_ffmpeg(input_path, output_path, upscale_config, tool_config)
+        result = _enhance_with_realesrgan(input_path, working_output_path, upscale_config, tool_config)
+    else:
+        result = _enhance_with_ffmpeg(input_path, working_output_path, upscale_config, tool_config)
+
+    final_path = _attach_cover(working_output_path, output_path, cover_path, tool_config)
+    if final_path != working_output_path and working_output_path.exists():
+        working_output_path.unlink()
+    return UpscaleOutcome(result.success, result.skipped, output_path, result.message.replace(str(working_output_path), str(output_path)), result.elapsed_seconds)

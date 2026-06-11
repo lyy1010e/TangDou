@@ -13,6 +13,7 @@ class SourceChoice:
     label: str
     is_hd: bool
     score: int
+    height: int = 0
 
 
 def _is_video_url(value, key_path):
@@ -38,7 +39,18 @@ def _height_from_text(text):
 
 def source_height(choice):
     """从候选源标签和 URL 中识别视频高度，识别不到返回 0。"""
-    return _height_from_text(f'{choice.label} {choice.url}')
+    return choice.height or _height_from_text(f'{choice.label} {choice.url}')
+
+
+def _height_from_node(node, key_path):
+    label = '.'.join(key_path)
+    if isinstance(node, dict):
+        height = max(_to_int(node.get('height')), _height_from_text(str(node)))
+        width = _to_int(node.get('width'))
+        if height:
+            return height
+        return int(width * 9 / 16) if width else 0
+    return _height_from_text(f'{label} {node}')
 
 
 def _score(node, key_path):
@@ -48,14 +60,11 @@ def _score(node, key_path):
     bitrate = 0
 
     if isinstance(node, dict):
-        height = max(_to_int(node.get('height')), _height_from_text(str(node)))
-        width = _to_int(node.get('width'))
+        height = _height_from_node(node, key_path)
         bitrate = max(_to_int(node.get('bitrate')), _to_int(node.get('vb')), _to_int(node.get('rate')))
-        if not height and width:
-            height = int(width * 9 / 16)
         text = f'{text} {node}'.lower()
     else:
-        height = _height_from_text(f'{label} {node}')
+        height = _height_from_node(node, key_path)
 
     quality_bonus = 0
     if any(word in text for word in HIGH_QUALITY_WORDS):
@@ -77,11 +86,16 @@ def _collect_candidates(node, key_path=()):
             if isinstance(value, str) and _is_video_url(value, child_path):
                 own_score = _score({str(key): value}, child_path)
                 score = max(own_score, _score(node, child_path)) if video_url_count == 1 else own_score
+                height = max(
+                    _height_from_node({str(key): value}, child_path),
+                    _height_from_node(node, child_path) if video_url_count == 1 else 0,
+                )
                 candidates.append(SourceChoice(
                     url=value,
                     label='.'.join(child_path),
                     is_hd=False,
                     score=score,
+                    height=height,
                 ))
             candidates.extend(_collect_candidates(value, child_path))
     elif isinstance(node, list):
@@ -91,14 +105,16 @@ def _collect_candidates(node, key_path=()):
 
 
 def _with_hd_flag(choice, fallback):
-    label_text = choice.label.lower()
+    label_text = f'{choice.label} {choice.url}'.lower()
     is_high_label = any(word in label_text for word in HIGH_QUALITY_WORDS)
     is_better_than_fallback = choice.url != fallback.url and choice.score > fallback.score
+    is_at_least_720p = source_height(choice) >= 720
     return SourceChoice(
         url=choice.url,
         label=choice.label,
-        is_hd=is_high_label or is_better_than_fallback,
+        is_hd=is_high_label or is_better_than_fallback or is_at_least_720p,
         score=choice.score,
+        height=choice.height,
     )
 
 
@@ -114,6 +130,7 @@ def select_best_source(play_data, prefer_highest_source=True):
         label='data.play_url',
         is_hd=False,
         score=_score({'play_url': fallback_url}, ('data', 'play_url')),
+        height=_height_from_node({'play_url': fallback_url}, ('data', 'play_url')),
     )
     candidates = _collect_candidates(data, ('data',))
     candidates.append(fallback)

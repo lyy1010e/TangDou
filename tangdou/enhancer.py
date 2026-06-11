@@ -67,8 +67,9 @@ def _encoder_attempts(ffmpeg_path):
     return [*hardware_attempts, CPU_ENCODER]
 
 
-def _output_path(input_path, upscale_config):
-    return Path(upscale_config.output_dir) / f'{input_path.stem}_{upscale_config.target_height}p.mp4'
+def _output_path(input_path, upscale_config, output_height=None):
+    height = output_height or upscale_config.target_height
+    return Path(upscale_config.output_dir) / f'{input_path.stem}_{height}p.mp4'
 
 
 def _temp_output_path(output_path):
@@ -91,10 +92,7 @@ def _video_filter(upscale_config):
     return f'scale=-2:{upscale_config.target_height}:flags=bicubic,unsharp=3:3:0.35,format=yuv420p'
 
 
-def _enhance_with_ffmpeg(input_path, output_path, upscale_config, tool_config):
-    if not _tool_exists(tool_config.ffmpeg_path):
-        return UpscaleOutcome(False, True, None, f'未找到 FFmpeg: {tool_config.ffmpeg_path}')
-
+def _run_ffmpeg_encode(input_path, output_path, upscale_config, tool_config, video_filter=None):
     start_time = time.time()
     temp_output_path = _temp_output_path(output_path)
     last_error = None
@@ -102,6 +100,7 @@ def _enhance_with_ffmpeg(input_path, output_path, upscale_config, tool_config):
     for encoder_name, encoder_args in _encoder_attempts(tool_config.ffmpeg_path):
         temp_output_path.unlink(missing_ok=True)
         try:
+            filter_args = ['-vf', video_filter] if video_filter else ['-vf', 'format=yuv420p']
             _run([
                 tool_config.ffmpeg_path,
                 '-hide_banner',
@@ -110,7 +109,7 @@ def _enhance_with_ffmpeg(input_path, output_path, upscale_config, tool_config):
                 *_seek_args(upscale_config.trim_head_seconds),
                 *_duration_args(upscale_config.trim_duration_seconds),
                 '-i', str(input_path),
-                '-vf', _video_filter(upscale_config),
+                *filter_args,
                 *encoder_args,
                 '-c:a', 'copy',
                 str(temp_output_path),
@@ -120,13 +119,34 @@ def _enhance_with_ffmpeg(input_path, output_path, upscale_config, tool_config):
 
             _ENCODER_CACHE[tool_config.ffmpeg_path] = (encoder_name, encoder_args)
             temp_output_path.replace(output_path)
-            elapsed = time.time() - start_time
-            return UpscaleOutcome(True, False, output_path, f'FFmpeg 增强完成({encoder_name}): {output_path}', elapsed)
+            return encoder_name, time.time() - start_time
         except Exception as e:
             last_error = e
             temp_output_path.unlink(missing_ok=True)
 
-    raise RuntimeError(f'FFmpeg 增强失败: {last_error}')
+    raise RuntimeError(f'FFmpeg 处理失败: {last_error}')
+
+
+def _enhance_with_ffmpeg(input_path, output_path, upscale_config, tool_config):
+    if not _tool_exists(tool_config.ffmpeg_path):
+        return UpscaleOutcome(False, True, None, f'未找到 FFmpeg: {tool_config.ffmpeg_path}')
+
+    encoder_name, elapsed = _run_ffmpeg_encode(
+        input_path,
+        output_path,
+        upscale_config,
+        tool_config,
+        video_filter=_video_filter(upscale_config),
+    )
+    return UpscaleOutcome(True, False, output_path, f'FFmpeg 增强完成({encoder_name}): {output_path}', elapsed)
+
+
+def _trim_with_ffmpeg(input_path, output_path, upscale_config, tool_config):
+    if not _tool_exists(tool_config.ffmpeg_path):
+        return UpscaleOutcome(False, True, None, f'未找到 FFmpeg: {tool_config.ffmpeg_path}')
+
+    encoder_name, elapsed = _run_ffmpeg_encode(input_path, output_path, upscale_config, tool_config)
+    return UpscaleOutcome(True, False, output_path, f'FFmpeg 裁剪完成({encoder_name}): {output_path}', elapsed)
 
 
 def _enhance_with_realesrgan(input_path, output_path, upscale_config, tool_config):
@@ -243,28 +263,38 @@ def _attach_cover(video_path, output_path, cover_path, tool_config):
     return output_path
 
 
-def enhance_video_to_1080p(input_path, upscale_config, tool_config, cover_path=None):
-    """按配置生成增强版视频。"""
+def _finish_processed_video(input_path, output_path, upscale_config, tool_config, cover_path, processor):
     input_path = Path(input_path)
     output_dir = Path(upscale_config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = _output_path(input_path, upscale_config)
     working_output_path = _video_only_temp_output_path(output_path) if cover_path else output_path
 
     if output_path.exists() and verify_mp4_file(output_path):
-        return UpscaleOutcome(True, True, output_path, f'增强版已存在: {output_path}')
+        return UpscaleOutcome(True, True, output_path, f'输出已存在: {output_path}')
     if output_path.exists():
         output_path.unlink()
     if not upscale_config.enabled:
-        return UpscaleOutcome(True, True, None, '视频增强未启用')
+        return UpscaleOutcome(True, True, None, '视频处理未启用')
     if working_output_path.exists():
         working_output_path.unlink()
-    if upscale_config.enhance_engine == 'realesrgan':
-        result = _enhance_with_realesrgan(input_path, working_output_path, upscale_config, tool_config)
-    else:
-        result = _enhance_with_ffmpeg(input_path, working_output_path, upscale_config, tool_config)
+    result = processor(input_path, working_output_path, upscale_config, tool_config)
 
     final_path = _attach_cover(working_output_path, output_path, cover_path, tool_config)
     if final_path != working_output_path and working_output_path.exists():
         working_output_path.unlink()
     return UpscaleOutcome(result.success, result.skipped, output_path, result.message.replace(str(working_output_path), str(output_path)), result.elapsed_seconds)
+
+
+def enhance_video_to_1080p(input_path, upscale_config, tool_config, cover_path=None):
+    """按配置生成增强版视频。"""
+    input_path = Path(input_path)
+    output_path = _output_path(input_path, upscale_config)
+    processor = _enhance_with_realesrgan if upscale_config.enhance_engine == 'realesrgan' else _enhance_with_ffmpeg
+    return _finish_processed_video(input_path, output_path, upscale_config, tool_config, cover_path, processor)
+
+
+def trim_video(input_path, upscale_config, tool_config, cover_path=None, source_height=0):
+    """只裁剪片头片尾，保留原分辨率。"""
+    input_path = Path(input_path)
+    output_path = _output_path(input_path, upscale_config, output_height=source_height or upscale_config.target_height)
+    return _finish_processed_video(input_path, output_path, upscale_config, tool_config, cover_path, _trim_with_ffmpeg)

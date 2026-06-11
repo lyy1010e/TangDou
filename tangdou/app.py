@@ -12,9 +12,9 @@ import requests
 
 from .config import load_config
 from .cover import download_cover, resolve_cover_url
-from .downloader import download_file_with_retry
-from .enhancer import enhance_video_to_1080p
-from .source_selector import collect_source_candidates, select_best_source, source_height
+from .downloader import DownloadOutcome, download_file_with_retry
+from .enhancer import enhance_video_to_1080p, trim_video
+from .source_selector import SourceChoice, collect_source_candidates, select_best_source, source_height
 from .utils import clean_filename, thread_safe_print
 
 
@@ -36,8 +36,8 @@ class VideoDownloadResult:
     video_info: str
     data: dict
     play_data: Optional[dict] = None
-    source_choice: object = None
-    outcome: object = None
+    source_choice: Optional[SourceChoice] = None
+    outcome: Optional[DownloadOutcome] = None
 
 
 def load_urls_from_log():
@@ -156,43 +156,67 @@ def _enhance_worker_count(config):
     return FFMPEG_ENHANCE_WORKERS
 
 
-def _should_enhance_download_result(download_result, upscale_config):
+def _has_trim_markers(data):
+    return _to_float(data.get('head_t'), 0.0) > 0 or _to_float(data.get('end_t'), 0.0) > 0
+
+
+def _source_height_text(source_size):
+    return f'{source_size}p' if source_size else '未知'
+
+
+def _postprocess_mode(download_result, upscale_config):
     is_new_download = download_result.success and download_result.outcome and download_result.outcome.downloaded
-    if not is_new_download or not download_result.source_choice:
-        return False
+    if not upscale_config.enabled or not is_new_download or not download_result.source_choice:
+        return None
 
     source_size = source_height(download_result.source_choice)
     is_low_source = source_size == 0 or source_size < upscale_config.target_height
-    return not download_result.source_choice.is_hd and is_low_source
+    should_trim_only = _has_trim_markers(download_result.data) and not is_low_source
+    if is_low_source:
+        return 'enhance'
+    if should_trim_only:
+        return 'trim'
+    return None
 
 
-def _handle_upscale(outcome, source_choice, config, counter, lock, video_info, data, play_data):
-    source_size = source_height(source_choice)
-    is_low_source = source_size == 0 or source_size < config.upscale.target_height
-    should_upscale = outcome.success and outcome.downloaded and config.upscale.enabled and not source_choice.is_hd and is_low_source
-    if not should_upscale:
+def _handle_postprocess(download_result, mode, config, counter, lock):
+    if not mode or not download_result.outcome or not download_result.source_choice:
         return
 
+    action_text = '增强' if mode == 'enhance' else '裁剪'
+    counter_prefix = 'upscale' if mode == 'enhance' else 'trim'
+    source_size = source_height(download_result.source_choice)
+    target_text = f'{config.upscale.target_height}p' if mode == 'enhance' else '原分辨率'
     try:
-        upscale_config = _video_upscale_config(config.upscale, data)
-        cover_url = resolve_cover_url(data, play_data)
+        upscale_config = _video_upscale_config(config.upscale, download_result.data)
+        cover_url = resolve_cover_url(download_result.data, download_result.play_data)
         cover_path = download_cover(
             cover_url,
-            Path(config.upscale.output_dir) / f'{outcome.filepath.stem}_cover.jpg',
+            Path(config.upscale.output_dir) / f'{download_result.outcome.filepath.stem}_cover.jpg',
             HEADERS,
         )
         thread_safe_print(
-            f'[增强] {video_info} 普通源下载完成，开始使用 {config.upscale.enhance_engine} '
-            f'生成 {config.upscale.target_height}p 增强版，裁剪片头 {upscale_config.trim_head_seconds:g} 秒'
+            f'[{action_text}] {download_result.video_info} 源:{_source_height_text(source_size)} -> {target_text} | '
+            f'引擎:{config.upscale.enhance_engine if mode == "enhance" else "ffmpeg"} | '
+            f'片头:{upscale_config.trim_head_seconds:g}秒'
         )
-        upscale_result = enhance_video_to_1080p(outcome.filepath, upscale_config, config.tools, cover_path=cover_path)
-        thread_safe_print(f'[增强] {video_info} {upscale_result.message}')
-        counter_key = 'upscale_skip' if upscale_result.skipped else 'upscale_success'
+        if mode == 'enhance':
+            upscale_result = enhance_video_to_1080p(download_result.outcome.filepath, upscale_config, config.tools, cover_path=cover_path)
+        else:
+            upscale_result = trim_video(
+                download_result.outcome.filepath,
+                upscale_config,
+                config.tools,
+                cover_path=cover_path,
+                source_height=source_size,
+            )
+        thread_safe_print(f'[{action_text}] {download_result.video_info} {upscale_result.message} | 耗时:{upscale_result.elapsed_seconds:.1f}秒')
+        counter_key = f'{counter_prefix}_skip' if upscale_result.skipped else f'{counter_prefix}_success'
         _update_counter(counter, lock, counter_key)
-        _add_counter(counter, lock, 'upscale_seconds', upscale_result.elapsed_seconds)
+        _add_counter(counter, lock, f'{counter_prefix}_seconds', upscale_result.elapsed_seconds)
     except Exception as e:
-        _update_counter(counter, lock, 'upscale_fail')
-        thread_safe_print(f'[增强失败] {video_info}: {e}')
+        _update_counter(counter, lock, f'{counter_prefix}_fail')
+        thread_safe_print(f'[{action_text}失败] {download_result.video_info}: {e}')
 
 
 def _print_play_response_debug(video_info, video_data):
@@ -208,7 +232,7 @@ def _print_play_response_debug(video_info, video_data):
         if len(url_text) > 160:
             url_text = f'{url_text[:157]}...'
         hd_text = '高清候选' if candidate.is_hd else '普通候选'
-        print(f'  - {hd_text} | score={candidate.score} | {candidate.label} | {url_text}')
+        print(f'  - {hd_text} | height={_source_height_text(source_height(candidate))} | score={candidate.score} | {candidate.label} | {url_text}')
 
 
 def download_single_video(data, num, page_size, download_dir, config, lock, retry_info_list, retry_lock):
@@ -229,7 +253,8 @@ def download_single_video(data, num, page_size, download_dir, config, lock, retr
             raise ValueError(source_choice.label)
 
         source_text = '高清源' if source_choice.is_hd else '普通源'
-        thread_safe_print(f'[源选择] {video_info} 使用{source_text}: {source_choice.label}')
+        source_size = source_height(source_choice)
+        thread_safe_print(f'[源选择] {video_info} 使用{source_text}: {source_choice.label} | 源:{_source_height_text(source_size)}')
 
         safe_title = clean_filename(title)
         filepath = download_dir / f'{num}_{safe_title}.mp4'
@@ -253,19 +278,10 @@ def download_single_video(data, num, page_size, download_dir, config, lock, retr
         return VideoDownloadResult(False, video_info, video_info, data)
 
 
-def enhance_single_video(download_result, config, counter, lock):
+def process_single_video(download_result, mode, config, counter, lock):
     if not download_result.success:
         return
-    _handle_upscale(
-        download_result.outcome,
-        download_result.source_choice,
-        config,
-        counter,
-        lock,
-        download_result.video_info,
-        download_result.data,
-        download_result.play_data,
-    )
+    _handle_postprocess(download_result, mode, config, counter, lock)
 
 
 def _print_retry_info(retry_info_list):
@@ -327,6 +343,10 @@ def download_video():
         'upscale_skip': 0,
         'upscale_fail': 0,
         'upscale_seconds': 0.0,
+        'trim_success': 0,
+        'trim_skip': 0,
+        'trim_fail': 0,
+        'trim_seconds': 0.0,
     }
     failed_files = []
     download_results = []
@@ -379,38 +399,43 @@ def download_video():
                 failed_files.append(f'{num} - {title} ({page_info})')
                 print(f'[错误] 任务执行异常 [{num}] ({page_info}): {e}')
 
-    enhance_candidates = [
-        result
+    postprocess_plans = [
+        (result, mode)
         for result in download_results
-        if _should_enhance_download_result(result, config.upscale)
+        for mode in [_postprocess_mode(result, config.upscale)]
+        if mode
     ]
-    if config.upscale.enabled and enhance_candidates:
+    if config.upscale.enabled and postprocess_plans:
         enhance_workers = _enhance_worker_count(config)
+        enhance_count = sum(1 for _, mode in postprocess_plans if mode == 'enhance')
+        trim_count = sum(1 for _, mode in postprocess_plans if mode == 'trim')
         print(f'\n{"=" * 60}')
-        print('[阶段3] 开始增强新下载的普通源视频')
-        print(f'[配置] 增强方式: {config.upscale.enhance_engine} | 目标: {config.upscale.target_height}p | 增强并发: {enhance_workers}')
+        print('[阶段3] 开始处理新下载视频')
+        print(f'[配置] 增强: {enhance_count} 个 | 只裁剪: {trim_count} 个 | 目标: {config.upscale.target_height}p | 并发: {enhance_workers}')
         print(f'{"=" * 60}\n')
 
         with ThreadPoolExecutor(max_workers=enhance_workers) as executor:
             future_info = {
-                executor.submit(enhance_single_video, result, config, counter, lock): result
-                for result in enhance_candidates
+                executor.submit(process_single_video, result, mode, config, counter, lock): (result, mode)
+                for result, mode in postprocess_plans
             }
-            enhance_completed = 0
+            process_completed = 0
             for future in as_completed(future_info):
-                result = future_info[future]
+                result, mode = future_info[future]
+                counter_prefix = 'upscale' if mode == 'enhance' else 'trim'
+                action_text = '增强' if mode == 'enhance' else '裁剪'
                 try:
                     future.result()
                 except Exception as e:
-                    _update_counter(counter, lock, 'upscale_fail')
-                    print(f'[增强失败] {result.video_info}: {e}')
-                enhance_completed += 1
-                if enhance_completed % 5 == 0 or enhance_completed == len(enhance_candidates):
-                    print(f'[增强进度] 已处理: {enhance_completed}/{len(enhance_candidates)}')
+                    _update_counter(counter, lock, f'{counter_prefix}_fail')
+                    print(f'[{action_text}失败] {result.video_info}: {e}')
+                process_completed += 1
+                if process_completed % 5 == 0 or process_completed == len(postprocess_plans):
+                    print(f'[处理进度] 已处理: {process_completed}/{len(postprocess_plans)}')
     elif not config.upscale.enabled:
-        print('\n[增强] 配置已关闭，跳过视频增强阶段')
+        print('\n[处理] 配置已关闭，跳过视频处理阶段')
     else:
-        print('\n[增强] 没有需要增强的新下载普通源视频')
+        print('\n[处理] 没有需要增强或裁剪的新下载视频')
 
     total_time = time.time() - start_time
     _print_retry_info(retry_info_list)
@@ -428,10 +453,15 @@ def download_video():
     print(f'  视频增强成功: {counter["upscale_success"]}')
     print(f'  视频增强跳过: {counter["upscale_skip"]}')
     print(f'  视频增强失败: {counter["upscale_fail"]}')
+    print(f'  视频裁剪成功: {counter["trim_success"]}')
+    print(f'  视频裁剪跳过: {counter["trim_skip"]}')
+    print(f'  视频裁剪失败: {counter["trim_fail"]}')
     print(f'  成功率: {(completed_success / total_count * 100):.1f}%' if total_count > 0 else '  成功率: 0%')
     print(f'  总耗时: {total_time:.1f}秒')
     if completed > 0:
         print(f'  平均耗时: {total_time / completed:.1f}秒/个')
     if counter['upscale_success'] > 0:
         print(f'  增强耗时: {counter["upscale_seconds"]:.1f}秒')
+    if counter['trim_success'] > 0:
+        print(f'  裁剪耗时: {counter["trim_seconds"]:.1f}秒')
     print(f'{"=" * 60}')

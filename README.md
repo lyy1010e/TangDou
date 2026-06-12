@@ -26,10 +26,9 @@ ffmpeg -version
 
 ## 使用
 
-先在手机上抓包收藏的数据，搜索 mod=fav，把接口 URL 放到 `urls.txt`，每行一个 URL：
+先在手机上抓包收藏的数据，搜索 mod=fav，把接口 URL 放到 `urls.txt`，放一个URL就行，工具会自动翻页下载所有数据：
 
 ```text
-https://example.com/api...
 https://example.com/api...
 ```
 
@@ -68,4 +67,4 @@ Real-ESRGAN 会逐帧处理视频，耗时和临时空间占用都明显更高�
 
 
 
-仅供学习交流使用，严禁用于商业用途及非法活动，一切法律责任由使用者自行承担。
+仅供学习交流使用，严禁用于商业用途及非法活动。

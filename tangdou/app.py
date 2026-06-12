@@ -15,6 +15,7 @@ from .cover import download_cover, resolve_cover_url
 from .downloader import DownloadOutcome, download_file_with_retry
 from .enhancer import enhance_video_to_1080p, trim_video
 from .source_selector import SourceChoice, collect_source_candidates, select_best_source, source_height
+from .url_signer import build_page_url
 from .utils import clean_filename, thread_safe_print
 
 
@@ -78,6 +79,12 @@ def load_urls_from_log():
     return urls
 
 
+def _response_error_text(response_data):
+    code = response_data.get('code')
+    msg = response_data.get('msg') or '未知错误'
+    return f'code={code}, msg={msg}'
+
+
 def collect_all_videos(download_urls, debug_api_response=False):
     """收集所有待下载的视频信息。"""
     all_videos = []
@@ -87,31 +94,49 @@ def collect_all_videos(download_urls, debug_api_response=False):
     print(f'{"=" * 60}')
 
     global_num = 1
-    for page_idx, collect_url in enumerate(download_urls, 1):
-        try:
-            print(f'\n[收集] 正在处理第{page_idx}页URL...')
-            response = requests.get(url=collect_url, headers=HEADERS, timeout=(30, 30))
-            response.raise_for_status()
-            response_data = response.json()
+    for template_idx, template_url in enumerate(download_urls, 1):
+        page_idx = 1
+        while True:
+            collect_url = build_page_url(template_url, page_idx)
+            try:
+                print(f'\n[收集] 模板{template_idx} 正在处理第{page_idx}页...')
+                response = requests.get(url=collect_url, headers=HEADERS, timeout=(30, 30))
+                response.raise_for_status()
+                response_data = response.json()
 
-            datas = response_data.get('datas', [])
-            page_size = response_data.get('pagesize', len(datas))
-            print(f'[收集] 第{page_idx}页: 找到 {len(datas)} 个视频 (pagesize: {page_size})')
+                response_code = response_data.get('code')
+                has_error_code = response_code is not None and str(response_code) != '0'
+                if has_error_code:
+                    print(f'[警告] 模板{template_idx} 第{page_idx}页接口返回异常: {_response_error_text(response_data)}')
+                    break
 
-            for index, data in enumerate(datas):
-                if debug_api_response:
-                    print(f'[调试] 第{page_idx}页-第{index + 1}个 列表接口视频条目:')
-                    print(json.dumps(data, ensure_ascii=False, indent=2))
-                all_videos.append({
-                    'data': data,
-                    'num': global_num,
-                    'page_info': f'第{page_idx}页-第{index + 1}个',
-                })
-                global_num += 1
+                datas = response_data.get('datas', [])
+                if not isinstance(datas, list):
+                    datas = []
 
-            time.sleep(0.3)
-        except Exception as e:
-            print(f'[错误] 处理第{page_idx}页URL失败: {e}')
+                page_size = response_data.get('pagesize', len(datas))
+                if not datas:
+                    print(f'[收集] 模板{template_idx} 第{page_idx}页无数据，自动翻页结束')
+                    break
+
+                print(f'[收集] 模板{template_idx} 第{page_idx}页: 找到 {len(datas)} 个视频 (pagesize: {page_size})')
+
+                for index, data in enumerate(datas):
+                    if debug_api_response:
+                        print(f'[调试] 模板{template_idx} 第{page_idx}页-第{index + 1}个 列表接口视频条目:')
+                        print(json.dumps(data, ensure_ascii=False, indent=2))
+                    all_videos.append({
+                        'data': data,
+                        'num': global_num,
+                        'page_info': f'模板{template_idx}-第{page_idx}页-第{index + 1}个',
+                    })
+                    global_num += 1
+
+                page_idx += 1
+                time.sleep(0.3)
+            except Exception as e:
+                print(f'[错误] 处理模板{template_idx} 第{page_idx}页失败: {e}')
+                break
 
     print(f'\n[收集完成] 共收集到 {len(all_videos)} 个待下载视频')
     print(f'{"=" * 60}\n')

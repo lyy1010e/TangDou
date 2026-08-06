@@ -34,6 +34,7 @@ TANGDOU_HEAD_EXTRA_SECONDS = 2.0
 class VideoDownloadResult:
     success: bool
     fail_info: Optional[str]
+    fail_reason: Optional[str]
     video_info: str
     data: dict
     play_data: Optional[dict] = None
@@ -191,16 +192,28 @@ def _source_height_text(source_size):
 
 def _postprocess_mode(download_result, upscale_config):
     is_new_download = download_result.success and download_result.outcome and download_result.outcome.downloaded
-    if not upscale_config.enabled or not is_new_download or not download_result.source_choice:
+    if not is_new_download or not download_result.source_choice:
+        return None
+
+    enhance_enabled = upscale_config.enabled
+    trim_enabled = upscale_config.trim_enabled
+    if not enhance_enabled and not trim_enabled:
         return None
 
     source_size = source_height(download_result.source_choice)
     is_low_source = source_size == 0 or source_size < upscale_config.target_height
-    should_trim_only = _has_trim_markers(download_result.data) and not is_low_source
-    if is_low_source:
+    has_trim = _has_trim_markers(download_result.data)
+
+    # 低分辨率源且开启了增强：走增强流程（增强时也会一并裁掉片头片尾）。
+    if is_low_source and enhance_enabled:
         return 'enhance'
-    if should_trim_only:
+    # 有片头片尾标记且开启了裁剪：只裁剪，保留原分辨率。
+    # 包括高分辨率源，或低分辨率源但未开启增强的情况。
+    if has_trim and trim_enabled:
         return 'trim'
+    # 开启了去片头片尾但没有标记：直接复制到 enhanced 目录，保证两边数量一致。
+    if trim_enabled:
+        return 'copy'
     return None
 
 
@@ -208,9 +221,38 @@ def _handle_postprocess(download_result, mode, config, counter, lock):
     if not mode or not download_result.outcome or not download_result.source_choice:
         return
 
+    source_size = source_height(download_result.source_choice)
+    if mode == 'copy':
+        action_text = '复制'
+        counter_prefix = 'copy'
+        target_text = '原分辨率'
+        try:
+            input_path = download_result.outcome.filepath
+            output_height = source_size or config.upscale.target_height
+            output_path = Path(config.upscale.output_dir) / f'{input_path.stem}_{output_height}p.mp4'
+            cover_url = resolve_cover_url(download_result.data, download_result.play_data)
+            cover_path = download_cover(
+                cover_url,
+                Path(config.upscale.output_dir) / f'{download_result.outcome.filepath.stem}_cover.jpg',
+                HEADERS,
+            )
+            thread_safe_print(
+                f'[{action_text}] {download_result.video_info} 源:{_source_height_text(source_size)} -> {target_text} | '
+                f'无片头片尾标记，直接复制'
+            )
+            start = time.time()
+            shutil.copy2(input_path, output_path)
+            elapsed = time.time() - start
+            thread_safe_print(f'[{action_text}] {download_result.video_info} 复制完成 -> {output_path.name} | 耗时:{elapsed:.1f}秒')
+            _update_counter(counter, lock, f'{counter_prefix}_success')
+            _add_counter(counter, lock, f'{counter_prefix}_seconds', elapsed)
+        except Exception as e:
+            _update_counter(counter, lock, f'{counter_prefix}_fail')
+            thread_safe_print(f'[{action_text}失败] {download_result.video_info}: {e}')
+        return
+
     action_text = '增强' if mode == 'enhance' else '裁剪'
     counter_prefix = 'upscale' if mode == 'enhance' else 'trim'
-    source_size = source_height(download_result.source_choice)
     target_text = f'{config.upscale.target_height}p' if mode == 'enhance' else '原分辨率'
     try:
         upscale_config = _video_upscale_config(config.upscale, download_result.data)
@@ -260,6 +302,18 @@ def _print_play_response_debug(video_info, video_data):
         print(f'  - {hd_text} | height={_source_height_text(source_height(candidate))} | score={candidate.score} | {candidate.label} | {url_text}')
 
 
+def _play_error_reason(video_data, fallback):
+    if not isinstance(video_data, dict):
+        return fallback
+    code = video_data.get('code')
+    msg = video_data.get('msg')
+    if msg:
+        return f'播放接口返回: {msg}'
+    if code not in (None, 0, '0'):
+        return f'播放接口返回异常 code={code}'
+    return fallback
+
+
 def download_single_video(data, num, page_size, download_dir, config, lock, retry_info_list, retry_lock):
     """下载单个视频，返回后续增强所需的信息。"""
     title = data.get('title', '未知')
@@ -275,7 +329,7 @@ def download_single_video(data, num, page_size, download_dir, config, lock, retr
 
         source_choice = select_best_source(video_data, PREFER_HIGHEST_SOURCE)
         if not source_choice.url:
-            raise ValueError(source_choice.label)
+            raise ValueError(_play_error_reason(video_data, source_choice.label))
 
         source_text = '高清源' if source_choice.is_hd else '普通源'
         source_size = source_height(source_choice)
@@ -294,13 +348,15 @@ def download_single_video(data, num, page_size, download_dir, config, lock, retr
 
         if outcome.success:
             thread_safe_print(f'✓ 下载成功: {video_info}')
-            return VideoDownloadResult(True, None, video_info, data, video_data, source_choice, outcome)
+            return VideoDownloadResult(True, None, None, video_info, data, video_data, source_choice, outcome)
 
-        thread_safe_print(f'✗ 下载失败: {video_info}')
-        return VideoDownloadResult(False, video_info, video_info, data, video_data, source_choice, outcome)
+        fail_reason = '下载文件失败，可能是源地址失效或网络分段无进展'
+        thread_safe_print(f'✗ 下载失败: {video_info} | {fail_reason}')
+        return VideoDownloadResult(False, video_info, fail_reason, video_info, data, video_data, source_choice, outcome)
     except Exception as e:
-        thread_safe_print(f'===》下载出错 [{num}]: {e}')
-        return VideoDownloadResult(False, video_info, video_info, data)
+        fail_reason = str(e) or type(e).__name__
+        thread_safe_print(f'===》下载出错 [{num}]: {fail_reason}')
+        return VideoDownloadResult(False, video_info, fail_reason, video_info, data)
 
 
 def process_single_video(download_result, mode, config, counter, lock):
@@ -372,6 +428,9 @@ def download_video():
         'trim_skip': 0,
         'trim_fail': 0,
         'trim_seconds': 0.0,
+        'copy_success': 0,
+        'copy_fail': 0,
+        'copy_seconds': 0.0,
     }
     failed_files = []
     download_results = []
@@ -415,7 +474,8 @@ def download_video():
                 completed_success += 1 if result.success else 0
                 completed_fail += 0 if result.success else 1
                 if not result.success and result.fail_info:
-                    failed_files.append(f'{result.fail_info} ({page_info})')
+                    reason_text = f' | 原因: {result.fail_reason}' if result.fail_reason else ''
+                    failed_files.append(f'{result.fail_info} ({page_info}){reason_text}')
                 if completed % 5 == 0 or completed == total_count:
                     print(f'[进度] 已完成: {completed}/{total_count} | 成功: {completed_success} | 失败: {completed_fail}')
             except Exception as e:
@@ -430,13 +490,16 @@ def download_video():
         for mode in [_postprocess_mode(result, config.upscale)]
         if mode
     ]
-    if config.upscale.enabled and postprocess_plans:
+    any_postprocess_enabled = config.upscale.enabled or config.upscale.trim_enabled
+    if postprocess_plans:
         enhance_workers = _enhance_worker_count(config)
         enhance_count = sum(1 for _, mode in postprocess_plans if mode == 'enhance')
         trim_count = sum(1 for _, mode in postprocess_plans if mode == 'trim')
+        copy_count = sum(1 for _, mode in postprocess_plans if mode == 'copy')
         print(f'\n{"=" * 60}')
         print('[阶段3] 开始处理新下载视频')
-        print(f'[配置] 增强: {enhance_count} 个 | 只裁剪: {trim_count} 个 | 目标: {config.upscale.target_height}p | 并发: {enhance_workers}')
+        print(f'[配置] 增强:{("开" if config.upscale.enabled else "关")} | 去片头片尾:{("开" if config.upscale.trim_enabled else "关")} | 目标: {config.upscale.target_height}p | 并发: {enhance_workers}')
+        print(f'[统计] 增强: {enhance_count} 个 | 只裁剪: {trim_count} 个 | 直接复制: {copy_count} 个')
         print(f'{"=" * 60}\n')
 
         with ThreadPoolExecutor(max_workers=enhance_workers) as executor:
@@ -447,8 +510,15 @@ def download_video():
             process_completed = 0
             for future in as_completed(future_info):
                 result, mode = future_info[future]
-                counter_prefix = 'upscale' if mode == 'enhance' else 'trim'
-                action_text = '增强' if mode == 'enhance' else '裁剪'
+                if mode == 'enhance':
+                    counter_prefix = 'upscale'
+                    action_text = '增强'
+                elif mode == 'trim':
+                    counter_prefix = 'trim'
+                    action_text = '裁剪'
+                else:
+                    counter_prefix = 'copy'
+                    action_text = '复制'
                 try:
                     future.result()
                 except Exception as e:
@@ -457,10 +527,10 @@ def download_video():
                 process_completed += 1
                 if process_completed % 5 == 0 or process_completed == len(postprocess_plans):
                     print(f'[处理进度] 已处理: {process_completed}/{len(postprocess_plans)}')
-    elif not config.upscale.enabled:
-        print('\n[处理] 配置已关闭，跳过视频处理阶段')
+    elif not any_postprocess_enabled:
+        print('\n[处理] 增强和去片头片尾均已关闭，跳过视频处理阶段')
     else:
-        print('\n[处理] 没有需要增强或裁剪的新下载视频')
+        print('\n[处理] 没有需要增强、裁剪或复制的新下载视频')
 
     total_time = time.time() - start_time
     _print_retry_info(retry_info_list)
@@ -481,6 +551,8 @@ def download_video():
     print(f'  视频裁剪成功: {counter["trim_success"]}')
     print(f'  视频裁剪跳过: {counter["trim_skip"]}')
     print(f'  视频裁剪失败: {counter["trim_fail"]}')
+    print(f'  视频直接复制: {counter["copy_success"]}')
+    print(f'  视频复制失败: {counter["copy_fail"]}')
     print(f'  成功率: {(completed_success / total_count * 100):.1f}%' if total_count > 0 else '  成功率: 0%')
     print(f'  总耗时: {total_time:.1f}秒')
     if completed > 0:

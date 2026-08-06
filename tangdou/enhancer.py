@@ -142,11 +142,36 @@ def _enhance_with_ffmpeg(input_path, output_path, upscale_config, tool_config):
 
 
 def _trim_with_ffmpeg(input_path, output_path, upscale_config, tool_config):
+    """裁掉片头片尾：优先使用 -c copy 流拷贝（快、无损、不膨胀）；失败时回退到重编码。"""
     if not _tool_exists(tool_config.ffmpeg_path):
         return UpscaleOutcome(False, True, None, f'未找到 FFmpeg: {tool_config.ffmpeg_path}')
 
-    encoder_name, elapsed = _run_ffmpeg_encode(input_path, output_path, upscale_config, tool_config)
-    return UpscaleOutcome(True, False, output_path, f'FFmpeg 裁剪完成({encoder_name}): {output_path}', elapsed)
+    start_time = time.time()
+    temp_output_path = _temp_output_path(output_path)
+    temp_output_path.unlink(missing_ok=True)
+    try:
+        _run([
+            tool_config.ffmpeg_path,
+            '-hide_banner',
+            '-loglevel', 'error',
+            '-y',
+            *_seek_args(upscale_config.trim_head_seconds),
+            *_duration_args(upscale_config.trim_duration_seconds),
+            '-i', str(input_path),
+            '-c', 'copy',
+            '-avoid_negative_ts', 'make_zero',
+            str(temp_output_path),
+        ])
+        if not verify_mp4_file(temp_output_path):
+            raise RuntimeError(f'FFmpeg 流拷贝输出校验失败: {temp_output_path}')
+        temp_output_path.replace(output_path)
+        elapsed = time.time() - start_time
+        return UpscaleOutcome(True, False, output_path, f'FFmpeg 裁剪完成(流拷贝): {output_path}', elapsed)
+    except Exception:
+        temp_output_path.unlink(missing_ok=True)
+        # 流拷贝失败（如时间戳异常）时回退到重编码
+        encoder_name, elapsed = _run_ffmpeg_encode(input_path, output_path, upscale_config, tool_config)
+        return UpscaleOutcome(True, False, output_path, f'FFmpeg 裁剪完成(重编码/{encoder_name}): {output_path}', elapsed)
 
 
 def _enhance_with_realesrgan(input_path, output_path, upscale_config, tool_config):
@@ -273,8 +298,6 @@ def _finish_processed_video(input_path, output_path, upscale_config, tool_config
         return UpscaleOutcome(True, True, output_path, f'输出已存在: {output_path}')
     if output_path.exists():
         output_path.unlink()
-    if not upscale_config.enabled:
-        return UpscaleOutcome(True, True, None, '视频处理未启用')
     if working_output_path.exists():
         working_output_path.unlink()
     result = processor(input_path, working_output_path, upscale_config, tool_config)

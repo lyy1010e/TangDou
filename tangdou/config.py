@@ -11,7 +11,10 @@ class DownloadConfig:
 
 @dataclass(frozen=True)
 class UpscaleConfig:
+    # 增强开关：true 时对低分辨率源做超分增强；false 时只下载/裁剪不增强。
     enabled: bool = True
+    # 去片头片尾开关：true 时根据视频的 head_t/end_t 标记裁掉片头片尾；与增强开关相互独立。
+    trim_enabled: bool = True
     enhance_engine: str = 'ffmpeg'
     target_height: int = 720
     trim_head_seconds: float = 0.0
@@ -100,6 +103,7 @@ def load_config(config_path='config.ini'):
     )
     upscale = UpscaleConfig(
         enabled=_get_bool(parser, 'upscale', 'enabled', defaults.upscale.enabled),
+        trim_enabled=_get_bool(parser, 'upscale', 'trim_enabled', defaults.upscale.trim_enabled),
         enhance_engine=_get_choice(parser, 'upscale', 'enhance_engine', defaults.upscale.enhance_engine, {'ffmpeg', 'realesrgan'}),
         target_height=_get_int(parser, 'upscale', 'target_height', defaults.upscale.target_height, min_value=1),
         output_dir=Path(parser.get('upscale', 'output_dir', fallback=str(defaults.upscale.output_dir))),
